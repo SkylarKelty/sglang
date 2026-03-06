@@ -1055,6 +1055,11 @@ class CudaGraphRunner:
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
 
+        # Model-specific pre-replay hook (e.g. TTS input embedding)
+        model = self.model_runner.model
+        if hasattr(model, "cuda_graph_prepare"):
+            model.cuda_graph_prepare(forward_batch)
+
         # Replay
         if self.enable_pdmux:
             graph_key = f"{get_current_stream_idx()}_{self.bs}"
@@ -1062,6 +1067,12 @@ class CudaGraphRunner:
             graph_key = self.bs
         self.graphs[graph_key].replay()
         output = self.output_buffers[graph_key]
+
+        # Model-specific post-replay hook (e.g. TTS state update)
+        if hasattr(model, "cuda_graph_post_replay"):
+            output = model.cuda_graph_post_replay(
+                output, forward_batch, self.raw_num_token
+            )
 
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:

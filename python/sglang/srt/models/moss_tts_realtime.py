@@ -576,6 +576,22 @@ class MossTTSRealtime(nn.Module):
         self._prev_audio_codes: Dict[int, torch.Tensor] = {}
         self._generated_history: Dict[int, List[torch.Tensor]] = {}
 
+        # Pre-allocated buffers for CUDA graph compatibility.
+        # During graph capture/replay the model cannot call .item() or use
+        # Python dicts, so input embeddings and output codes go through
+        # fixed-address GPU tensors that the graph can reference.
+        _GRAPH_MAX_BS = 64
+        self.register_buffer(
+            "_graph_input_embeds",
+            torch.zeros(_GRAPH_MAX_BS, lang_config.hidden_size),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_audio_codes_buffer",
+            torch.zeros(_GRAPH_MAX_BS, self.num_rvq, dtype=torch.long),
+            persistent=False,
+        )
+
     def pad_input_ids(
         self, input_ids: List[int], _mm_inputs=None
     ) -> List[int]:
@@ -746,81 +762,37 @@ class MossTTSRealtime(nn.Module):
     ) -> LogitsProcessorOutput:
         """Decode: generate next audio codes given previous step.
 
-        Constructs multi-channel embeddings from text queue + previous audio
-        codes as a flat (batch_size, hidden_size) tensor for SGLang's decode.
+        CUDA-graph-compatible: during capture, reads pre-computed embeddings
+        from ``_graph_input_embeds`` and writes output codes to
+        ``_audio_codes_buffer``.  In eager mode it computes everything inline.
         """
         batch_size = forward_batch.batch_size
         device = input_ids.device
-        dtype = self.embed_tokens[0].weight.dtype
-
-        # Construct multi-channel embeddings: (batch_size, hidden_size)
-        input_embeds = torch.zeros(
-            batch_size, self.hidden_size, device=device, dtype=dtype
+        is_capturing = (
+            device.type == "cuda" and torch.cuda.is_current_stream_capturing()
         )
 
-        if forward_batch.req_pool_indices is not None:
-            for idx in range(batch_size):
-                req_idx = forward_batch.req_pool_indices[idx].item()
-
-                # Text channel (channel 0)
-                text_token = TEXT_PAD_ID
-                if req_idx in self._text_queue and req_idx in self._text_cursor:
-                    cursor = self._text_cursor[req_idx]
-                    text_ids = self._text_queue[req_idx]
-                    if cursor < len(text_ids):
-                        text_token = text_ids[cursor]
-                        self._text_cursor[req_idx] = cursor + 1
-
-                text_id = torch.tensor(
-                    [text_token], device=device, dtype=torch.long
-                )
-                embed = self.embed_tokens[0](text_id)  # (1, hidden)
-
-                # Audio channels (1..16)
-                if req_idx in self._prev_audio_codes:
-                    prev_codes = self._prev_audio_codes[req_idx]
-                    for ch in range(self.num_rvq):
-                        code_id = prev_codes[ch : ch + 1]  # (1,)
-                        embed = embed + self.embed_tokens[ch + 1](code_id)
-                else:
-                    pad_id = torch.tensor(
-                        [AUDIO_PAD_TOKEN], device=device, dtype=torch.long
-                    )
-                    for ch in range(self.num_rvq):
-                        embed = embed + self.embed_tokens[ch + 1](pad_id)
-
-                input_embeds[idx] = embed.squeeze(0)
+        if is_capturing:
+            # Graph capture: use pre-allocated buffer (filled during capture
+            # warmup or by cuda_graph_prepare before replay).
+            input_embeds = self._graph_input_embeds[:batch_size]
+        else:
+            # Eager mode: compute multi-channel embeddings inline.
+            input_embeds = self._compute_decode_embeds(forward_batch)
 
         # Run backbone with KV cache
         hidden_states = self.language_model(
             input_ids, positions, forward_batch, input_embeds=input_embeds
         )
-        # hidden_states: (batch_size, hidden_size)
         backbone_h = hidden_states.unsqueeze(1)  # (batch, 1, hidden)
 
-        # Build history tensor for repetition penalty
+        # Build repetition-penalty history (skipped during graph capture)
         gen_history = None
         max_history = 0
-        if forward_batch.req_pool_indices is not None:
-            for req_idx in forward_batch.req_pool_indices.tolist():
-                if req_idx in self._generated_history:
-                    max_history = max(
-                        max_history, len(self._generated_history[req_idx])
-                    )
-            if max_history > 0:
-                gen_history = torch.full(
-                    (batch_size, max_history, self.num_rvq),
-                    AUDIO_PAD_TOKEN,
-                    dtype=torch.long,
-                    device=device,
-                )
-                for idx, req_idx in enumerate(
-                    forward_batch.req_pool_indices.tolist()
-                ):
-                    if req_idx in self._generated_history:
-                        hist = self._generated_history[req_idx]
-                        for t, codes in enumerate(hist):
-                            gen_history[idx, t] = codes
+        if not is_capturing:
+            gen_history, max_history = self._build_rep_history(
+                forward_batch, device
+            )
 
         # Run local transformer — generates all 16 RVQ codes
         audio_codes = self.local_transformer.forward(
@@ -834,17 +806,10 @@ class MossTTSRealtime(nn.Module):
             gen_step=max_history,
         )
 
-        # Update per-request state
-        if forward_batch.req_pool_indices is not None:
-            for idx, req_idx in enumerate(
-                forward_batch.req_pool_indices.tolist()
-            ):
-                self._prev_audio_codes[req_idx] = audio_codes[idx]
-                if req_idx not in self._generated_history:
-                    self._generated_history[req_idx] = []
-                self._generated_history[req_idx].append(audio_codes[idx])
+        # Write codes to pre-allocated buffer (graph-safe write)
+        self._audio_codes_buffer[:batch_size] = audio_codes
 
-        # Return first codebook logits (one-hot) + all 16 codes in customized_info
+        # Build one-hot logits for SGLang sampling
         first_codes = audio_codes[:, 0]
         logits = torch.full(
             (batch_size, self.audio_vocab_size),
@@ -853,13 +818,155 @@ class MossTTSRealtime(nn.Module):
         )
         logits.scatter_(1, first_codes.unsqueeze(1), 100.0)
 
-        all_codes_list = [
+        if not is_capturing:
+            # Eager mode: update state + build customized_info now.
+            self._update_decode_state(forward_batch, audio_codes)
+            codes_list = [
+                audio_codes[i].tolist() for i in range(batch_size)
+            ]
+            return LogitsProcessorOutput(
+                next_token_logits=logits,
+                customized_info={"audio_rvq_codes": codes_list},
+            )
+
+        # During capture: return logits only; customized_info will be
+        # populated by cuda_graph_post_replay() after each graph replay.
+        return LogitsProcessorOutput(next_token_logits=logits)
+
+    # ------------------------------------------------------------------
+    # Helpers for decode embedding / state (called in eager mode only)
+    # ------------------------------------------------------------------
+
+    def _compute_decode_embeds(
+        self, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        """Build multi-channel embeddings for decode (text + 16 audio)."""
+        batch_size = forward_batch.batch_size
+        device = self._graph_input_embeds.device
+        dtype = self.embed_tokens[0].weight.dtype
+        input_embeds = torch.zeros(
+            batch_size, self.hidden_size, device=device, dtype=dtype
+        )
+        if forward_batch.req_pool_indices is None:
+            return input_embeds
+
+        for idx in range(batch_size):
+            req_idx = forward_batch.req_pool_indices[idx].item()
+
+            # Text channel (channel 0)
+            text_token = TEXT_PAD_ID
+            if req_idx in self._text_queue and req_idx in self._text_cursor:
+                cursor = self._text_cursor[req_idx]
+                text_ids = self._text_queue[req_idx]
+                if cursor < len(text_ids):
+                    text_token = text_ids[cursor]
+                    self._text_cursor[req_idx] = cursor + 1
+
+            text_id = torch.tensor(
+                [text_token], device=device, dtype=torch.long
+            )
+            embed = self.embed_tokens[0](text_id)
+
+            # Audio channels (1..16)
+            if req_idx in self._prev_audio_codes:
+                prev_codes = self._prev_audio_codes[req_idx]
+                for ch in range(self.num_rvq):
+                    embed = embed + self.embed_tokens[ch + 1](
+                        prev_codes[ch : ch + 1]
+                    )
+            else:
+                pad_id = torch.tensor(
+                    [AUDIO_PAD_TOKEN], device=device, dtype=torch.long
+                )
+                for ch in range(self.num_rvq):
+                    embed = embed + self.embed_tokens[ch + 1](pad_id)
+
+            input_embeds[idx] = embed.squeeze(0)
+        return input_embeds
+
+    def _build_rep_history(
+        self, forward_batch: ForwardBatch, device: torch.device
+    ) -> Tuple[Optional[torch.Tensor], int]:
+        """Build repetition-penalty history tensor."""
+        max_history = 0
+        if forward_batch.req_pool_indices is None:
+            return None, 0
+        for req_idx in forward_batch.req_pool_indices.tolist():
+            if req_idx in self._generated_history:
+                max_history = max(
+                    max_history, len(self._generated_history[req_idx])
+                )
+        if max_history == 0:
+            return None, 0
+
+        batch_size = forward_batch.batch_size
+        gen_history = torch.full(
+            (batch_size, max_history, self.num_rvq),
+            AUDIO_PAD_TOKEN,
+            dtype=torch.long,
+            device=device,
+        )
+        for idx, req_idx in enumerate(
+            forward_batch.req_pool_indices.tolist()
+        ):
+            if req_idx in self._generated_history:
+                for t, codes in enumerate(self._generated_history[req_idx]):
+                    gen_history[idx, t] = codes
+        return gen_history, max_history
+
+    def _update_decode_state(
+        self, forward_batch: ForwardBatch, audio_codes: torch.Tensor
+    ):
+        """Update per-request state dicts after decode."""
+        if forward_batch.req_pool_indices is None:
+            return
+        for idx, req_idx in enumerate(
+            forward_batch.req_pool_indices.tolist()
+        ):
+            self._prev_audio_codes[req_idx] = audio_codes[idx]
+            if req_idx not in self._generated_history:
+                self._generated_history[req_idx] = []
+            self._generated_history[req_idx].append(audio_codes[idx])
+
+    # ------------------------------------------------------------------
+    # CUDA graph hooks (called by CudaGraphRunner before/after replay)
+    # ------------------------------------------------------------------
+
+    def cuda_graph_prepare(self, forward_batch: ForwardBatch):
+        """Pre-compute decode embeddings before CUDA graph replay.
+
+        Called by ``CudaGraphRunner.replay()`` before graph replay.
+        Fills ``_graph_input_embeds`` so the captured graph reads fresh
+        embeddings from the same memory address.
+        """
+        embeds = self._compute_decode_embeds(forward_batch)
+        bs = embeds.shape[0]
+        self._graph_input_embeds[:bs] = embeds
+
+    def cuda_graph_post_replay(
+        self,
+        output: LogitsProcessorOutput,
+        forward_batch: ForwardBatch,
+        num_tokens: int,
+    ) -> LogitsProcessorOutput:
+        """Update state and populate customized_info after graph replay.
+
+        Called by ``CudaGraphRunner.replay()`` after the graph has run.
+        Reads generated codes from ``_audio_codes_buffer`` which was
+        written by the replayed graph.
+        """
+        batch_size = forward_batch.batch_size
+        audio_codes = self._audio_codes_buffer[:batch_size]
+        self._update_decode_state(forward_batch, audio_codes)
+
+        codes_list = [
             audio_codes[i].tolist() for i in range(batch_size)
         ]
-
         return LogitsProcessorOutput(
-            next_token_logits=logits,
-            customized_info={"audio_rvq_codes": all_codes_list},
+            next_token_logits=output.next_token_logits,
+            full_logits=output.full_logits if hasattr(output, "full_logits") else None,
+            hidden_states=output.hidden_states if hasattr(output, "hidden_states") else None,
+            customized_info={"audio_rvq_codes": codes_list},
         )
 
     def get_generated_audio_codes(self, req_idx: int) -> Optional[np.ndarray]:

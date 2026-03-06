@@ -10,6 +10,12 @@ The processor tokenizes the full prompt and separates it into:
   - input_ids: the prompt tokens consumed during prefill
   - text_ids (in model_specific_data): the input text tokens that the
     model consumes one-per-step during autoregressive decode
+
+The multi-channel format follows the original MossTTSRealtime inference:
+  - Each position has 17 values: [text_token, audio_ch1, ..., audio_ch16]
+  - Audio channels are AUDIO_PAD_TOKEN (1024) during prefill
+  - The LAST prefill position has AUDIO_BOS_TOKEN (1025) in channel 1
+    to signal the start of audio generation
 """
 
 import logging
@@ -29,30 +35,16 @@ from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProces
 
 logger = logging.getLogger(__name__)
 
-# System prompt template used by MOSS-TTS-Realtime
+# System prompt template used by MOSS-TTS-Realtime (must match original)
 SYSTEM_PROMPT = (
     "<|im_start|>system\n"
-    "You are a highly expressive text-to-speech (TTS) engine that generates "
-    "natural speech with subtle inflections: gentle pauses at commas, slight "
-    "rises at questions, and calm, warm phrasing. Keep it conversational and "
-    "human-like — not robotic or overly dramatic.\n"
+    "You are a highly expressive text-to-speech (TTS) engine developed by "
+    "Mosi Intelligence. \n"
+    "You possess natural language understanding, emotional modeling, and "
+    "multi-style speech generation capabilities, allowing you to generate "
+    "the corresponding speech based on the text given in the assistant."
     "<|im_end|>\n"
 )
-
-CONTEXT_TEMPLATE_WITH_AUDIO = (
-    "<|im_start|>context\n"
-    "The assistant section should be synthesized using the following voice "
-    "timbre:{audio_pad_tokens}\n"
-    "<|im_end|>\n"
-)
-
-CONTEXT_TEMPLATE_NO_AUDIO = (
-    "<|im_start|>context\n"
-    "The assistant section should be synthesized using the default voice.\n"
-    "<|im_end|>\n"
-)
-
-ASSISTANT_PREFIX = "<|im_start|>assistant\n"
 
 
 class MossTTSProcessor(BaseMultimodalProcessor):
@@ -79,70 +71,63 @@ class MossTTSProcessor(BaseMultimodalProcessor):
         """Build the TTS input from text and optional reference audio.
 
         Returns a dict with:
-          - input_ids: tokenized prompt (system + context + assistant prefix)
+          - input_ids: tokenized prompt (system prompt + text prefix)
           - mm_items: list with a single MultimodalDataItem that carries
-            text_ids and text_cursor in model_specific_data, so the model
-            can consume text tokens one-per-step during decode.
+            multi_channel_ids, text_ids and text_cursor in model_specific_data
         """
-        has_ref_audio = audio_data and len(audio_data) > 0
-
-        # Build context section
-        if has_ref_audio:
-            num_ref_tokens = 500
-            audio_pad_tokens = "<|audio_pad|>" * num_ref_tokens
-            context = CONTEXT_TEMPLATE_WITH_AUDIO.format(
-                audio_pad_tokens=audio_pad_tokens
-            )
-        else:
-            context = CONTEXT_TEMPLATE_NO_AUDIO
-
-        # Build the full prompt (system + context + assistant prefix)
-        # The input_text is what the model should speak — it becomes the
-        # text token queue consumed during decode, not part of prefill.
-        prompt_prefix = SYSTEM_PROMPT + context + ASSISTANT_PREFIX
-
-        # Tokenize the prompt prefix (consumed during prefill)
+        # Tokenize the input text (what the model should speak)
         if hasattr(self._tokenizer, "encode"):
-            prefix_ids = self._tokenizer.encode(
-                prompt_prefix, add_special_tokens=False
-            )
             text_ids = self._tokenizer.encode(
                 input_text, add_special_tokens=False
             )
         else:
-            prefix_ids = self._processor.encode(
-                prompt_prefix, add_special_tokens=False
-            )
             text_ids = self._processor.encode(
                 input_text, add_special_tokens=False
             )
 
-        # Build multi-channel input_ids for prefill.
-        # Each position has 17 values: [text_token, audio_ch1, ..., audio_ch16]
-        # During prefill, audio channels are all AUDIO_PAD_TOKEN (no audio yet).
-        # We prepend a few text tokens from text_ids to "prime" the model
-        # (the MOSS-TTS inferencer primes with ~12 text tokens).
+        # Build system prompt (matches original MossTTSRealtimeProcessor)
+        system_prompt_text = SYSTEM_PROMPT
+
+        if hasattr(self._tokenizer, "encode"):
+            system_ids = self._tokenizer.encode(
+                system_prompt_text, add_special_tokens=False
+            )
+        else:
+            system_ids = self._processor.encode(
+                system_prompt_text, add_special_tokens=False
+            )
+
+        # Build system prompt multi-channel tokens
+        sys_len = len(system_ids)
+        sys_mc = np.full(
+            (sys_len, 1 + NUM_RVQ_CHANNELS),
+            AUDIO_PAD_TOKEN,
+            dtype=np.int64,
+        )
+        sys_mc[:, 0] = system_ids
+
+        # Build text prefix: first N text tokens "prime" the model.
+        # The original inference primes with ~12 tokens.
         num_prime = min(12, len(text_ids))
         prime_text_ids = text_ids[:num_prime]
         remaining_text_ids = text_ids[num_prime:]
 
-        # The prefill input is: prefix_ids + prime_text_ids
-        prefill_text_ids = prefix_ids + prime_text_ids
-
-        # Build the multi-channel tensor for prefill:
-        # shape = (seq_len, 1 + NUM_RVQ_CHANNELS) = (seq_len, 17)
-        seq_len = len(prefill_text_ids)
-        multi_channel = np.full(
-            (seq_len, 1 + NUM_RVQ_CHANNELS),
+        # Build text prefix multi-channel tokens
+        prime_len = len(prime_text_ids)
+        text_mc = np.full(
+            (prime_len, 1 + NUM_RVQ_CHANNELS),
             AUDIO_PAD_TOKEN,
             dtype=np.int64,
         )
-        # Channel 0 = text tokens
-        multi_channel[:, 0] = prefill_text_ids
-        # Audio channels stay as AUDIO_PAD_TOKEN during prefill
-        # Except: set audio BOS for the last (primed) positions
-        for i in range(len(prefix_ids), seq_len):
-            multi_channel[i, 1:] = AUDIO_BOS_TOKEN
+        text_mc[:, 0] = prime_text_ids
+
+        # Signal start of audio generation: BOS in channel 1 at
+        # the LAST text position only (matches original inference).
+        text_mc[prime_len - 1, 1] = AUDIO_BOS_TOKEN
+
+        # Concatenate system prompt + text prefix
+        multi_channel = np.concatenate([sys_mc, text_mc], axis=0)
+        prefill_text_ids = system_ids + prime_text_ids
 
         # Create a MultimodalDataItem that carries:
         # - multi_channel_ids: the multi-channel prefill tensor
@@ -159,6 +144,7 @@ class MossTTSProcessor(BaseMultimodalProcessor):
         )
 
         # If reference audio provided, load it and add to model_specific_data
+        has_ref_audio = audio_data and len(audio_data) > 0
         if has_ref_audio:
             from sglang.srt.utils import load_audio
 

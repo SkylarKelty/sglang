@@ -480,32 +480,26 @@ class TestMossTTSProcessor(CustomTestCase):
     def _try_import_templates(self):
         try:
             from sglang.srt.multimodal.processors.moss_tts import (
-                ASSISTANT_PREFIX,
-                CONTEXT_TEMPLATE_NO_AUDIO,
-                CONTEXT_TEMPLATE_WITH_AUDIO,
                 SYSTEM_PROMPT,
             )
-            return SYSTEM_PROMPT, CONTEXT_TEMPLATE_NO_AUDIO, CONTEXT_TEMPLATE_WITH_AUDIO, ASSISTANT_PREFIX
+            return SYSTEM_PROMPT
         except ImportError:
             self.skipTest("Processor imports require CUDA dependencies")
 
     def test_system_prompt_template(self):
         """System prompt template contains expected markers."""
-        SYSTEM_PROMPT, CONTEXT_TEMPLATE_NO_AUDIO, _, ASSISTANT_PREFIX = self._try_import_templates()
+        SYSTEM_PROMPT = self._try_import_templates()
 
         self.assertIn("<|im_start|>system", SYSTEM_PROMPT)
         self.assertIn("<|im_end|>", SYSTEM_PROMPT)
-        self.assertIn("context", CONTEXT_TEMPLATE_NO_AUDIO)
-        self.assertIn("assistant", ASSISTANT_PREFIX)
+        self.assertIn("Mosi Intelligence", SYSTEM_PROMPT)
 
     def test_context_template_with_audio_substitution(self):
-        """Audio pad tokens are correctly substituted into template."""
-        _, _, CONTEXT_TEMPLATE_WITH_AUDIO, _ = self._try_import_templates()
-
-        result = CONTEXT_TEMPLATE_WITH_AUDIO.format(
-            audio_pad_tokens="<|audio_pad|>" * 3
-        )
-        self.assertEqual(result.count("<|audio_pad|>"), 3)
+        """System prompt is a plain string (no format placeholders)."""
+        SYSTEM_PROMPT = self._try_import_templates()
+        # System prompt should be a complete string, not a template
+        self.assertIsInstance(SYSTEM_PROMPT, str)
+        self.assertGreater(len(SYSTEM_PROMPT), 50)
 
     def test_processor_async_builds_multi_channel(self):
         """process_mm_data_async builds multi-channel tensor with correct shape."""
@@ -513,7 +507,7 @@ class TestMossTTSProcessor(CustomTestCase):
 
         ProcessorClass = self._try_import_processor()
 
-        # Mock tokenizer
+        # Mock tokenizer — encode is called for input text then system prompt
         mock_tokenizer = MagicMock()
         mock_tokenizer.encode.side_effect = lambda text, **kw: list(range(len(text)))
 
@@ -545,6 +539,19 @@ class TestMossTTSProcessor(CustomTestCase):
         # multi_channel_ids should have 17 columns (1 text + 16 audio)
         self.assertEqual(msd["multi_channel_ids"].shape[1], 17)
 
+        # BOS should ONLY be in channel 1 at the LAST position
+        mc = msd["multi_channel_ids"]
+        last_row = mc[-1]
+        # Channel 1 at last position should be BOS (1025)
+        self.assertEqual(last_row[1], 1025)
+        # All other audio channels at last position should be PAD (1024)
+        for ch in range(2, 17):
+            self.assertEqual(last_row[ch], 1024, f"channel {ch} at last pos should be PAD")
+        # All non-last positions should have PAD in all audio channels
+        for pos in range(mc.shape[0] - 1):
+            for ch in range(1, 17):
+                self.assertEqual(mc[pos, ch], 1024, f"pos {pos} ch {ch} should be PAD")
+
     def test_processor_primes_up_to_12_tokens(self):
         """Processor primes at most 12 text tokens during prefill."""
         import asyncio
@@ -552,10 +559,10 @@ class TestMossTTSProcessor(CustomTestCase):
         ProcessorClass = self._try_import_processor()
 
         mock_tokenizer = MagicMock()
-        # Return 20 tokens for prefix, 20 for input text
-        prefix_tokens = list(range(100, 120))
+        # encode is called twice: once for system prompt, once for input text
+        system_tokens = list(range(100, 120))
         text_tokens = list(range(200, 220))
-        mock_tokenizer.encode.side_effect = [prefix_tokens, text_tokens]
+        mock_tokenizer.encode.side_effect = [text_tokens, system_tokens]
 
         proc = ProcessorClass.__new__(ProcessorClass)
         proc._tokenizer = mock_tokenizer
@@ -581,9 +588,10 @@ class TestMossTTSProcessor(CustomTestCase):
         ProcessorClass = self._try_import_processor()
 
         mock_tokenizer = MagicMock()
-        prefix_tokens = list(range(100, 110))
+        # encode is called twice: once for input text, once for system prompt
         text_tokens = list(range(200, 205))  # only 5 tokens
-        mock_tokenizer.encode.side_effect = [prefix_tokens, text_tokens]
+        system_tokens = list(range(100, 110))
+        mock_tokenizer.encode.side_effect = [text_tokens, system_tokens]
 
         proc = ProcessorClass.__new__(ProcessorClass)
         proc._tokenizer = mock_tokenizer

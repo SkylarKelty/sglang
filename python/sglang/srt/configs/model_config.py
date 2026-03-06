@@ -1360,7 +1360,7 @@ def is_audio_model(model_architectures: List[str]):
 
 def is_tts_model(model_architectures: List[str]):
     models = [
-        "MossTTSRealtimeForCausalLM",
+        "MossTTSRealtime",
     ]
     return any(model in model_architectures for model in models)
 

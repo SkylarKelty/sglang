@@ -23,7 +23,7 @@ from sglang.srt.models.moss_tts_realtime import (
     AUDIO_PAD_TOKEN,
     NUM_RVQ_CHANNELS,
     REFERENCE_AUDIO_PAD_ID,
-    MossTTSRealtimeForSGLang,
+    MossTTSRealtime,
 )
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 
@@ -63,7 +63,7 @@ class MossTTSProcessor(BaseMultimodalProcessor):
     for voice cloning, not the content to transcribe.
     """
 
-    models = [MossTTSRealtimeForSGLang]
+    models = [MossTTSRealtime]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)

@@ -224,7 +224,7 @@ class TestModelConfig(CustomTestCase):
         """is_tts_model correctly detects MossTTSRealtime."""
         from sglang.srt.configs.model_config import is_tts_model
 
-        self.assertTrue(is_tts_model(["MossTTSRealtimeForCausalLM"]))
+        self.assertTrue(is_tts_model(["MossTTSRealtime"]))
 
     def test_is_not_tts_model(self):
         """Non-TTS models are not detected as TTS."""
@@ -244,7 +244,7 @@ class TestModelConfig(CustomTestCase):
         from sglang.srt.configs.model_config import is_tts_model
 
         self.assertTrue(
-            is_tts_model(["LlamaForCausalLM", "MossTTSRealtimeForCausalLM"])
+            is_tts_model(["LlamaForCausalLM", "MossTTSRealtime"])
         )
 
 
@@ -522,7 +522,7 @@ class TestMossTTSProcessor(CustomTestCase):
         proc._tokenizer = mock_tokenizer
         proc._processor = mock_tokenizer
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             proc.process_mm_data_async(
                 image_data=None,
                 audio_data=None,
@@ -561,7 +561,7 @@ class TestMossTTSProcessor(CustomTestCase):
         proc._tokenizer = mock_tokenizer
         proc._processor = mock_tokenizer
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             proc.process_mm_data_async(
                 image_data=None,
                 audio_data=None,
@@ -589,7 +589,7 @@ class TestMossTTSProcessor(CustomTestCase):
         proc._tokenizer = mock_tokenizer
         proc._processor = mock_tokenizer
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             proc.process_mm_data_async(
                 image_data=None,
                 audio_data=None,

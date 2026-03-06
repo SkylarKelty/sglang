@@ -217,7 +217,7 @@ class MossTTSLocalTransformer(nn.Module):
         return scores.unsqueeze(1)
 
 
-class MossTTSRealtimeForSGLang(nn.Module):
+class MossTTSRealtime(nn.Module):
     """MOSS-TTS-Realtime model adapted for SGLang inference.
 
     Wraps the backbone (Qwen3) and local transformer into SGLang's
@@ -602,4 +602,4 @@ class MossTTSRealtimeForSGLang(nn.Module):
             )
 
 
-EntryClass = [MossTTSRealtimeForSGLang]
+EntryClass = [MossTTSRealtime]

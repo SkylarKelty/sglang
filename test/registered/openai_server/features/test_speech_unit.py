@@ -167,9 +167,9 @@ class TestAudioCodecDecodeRvqCodes(CustomTestCase):
         from sglang.srt.audio.codec import AudioCodec
 
         mock_model = MagicMock()
-        # Make parameters() return a tensor so device detection works
+        # parameters() is called multiple times; return a fresh iterator each time
         param = torch.zeros(1)
-        mock_model.parameters.return_value = iter([param])
+        mock_model.parameters.side_effect = lambda: iter([param])
         # Mock decode to return a 1D waveform
         mock_model.decode.return_value = torch.randn(1, 1, 480)
 
@@ -181,24 +181,32 @@ class TestAudioCodecDecodeRvqCodes(CustomTestCase):
         self.assertTrue(mock_model.decode.called)
         call_args = mock_model.decode.call_args
         codes_arg = call_args[0][0] if call_args[0] else call_args[1].get("tokens")
-        # The tensor passed to self.decode() has shape (num_codebooks, seq_len)
-        self.assertEqual(codes_arg.shape[-1], 2)  # 2 time steps
+        # decode() permutes (num_codebooks, seq_len) → (seq_len, num_codebooks)
+        # so the arg passed to model.decode has shape (2, 16)
+        self.assertEqual(codes_arg.shape[0], 2)   # 2 time steps
+        self.assertEqual(codes_arg.shape[1], 16)   # 16 codebooks
 
 
 class TestIOStructOutputModality(CustomTestCase):
     """Test that output_modality field works in GenerateReqInput."""
 
+    def _import_generate_req_input(self):
+        try:
+            from sglang.srt.managers.io_struct import GenerateReqInput
+
+            return GenerateReqInput
+        except ImportError:
+            self.skipTest("sgl_kernel not available (no CUDA)")
+
     def test_output_modality_default(self):
         """Test that output_modality defaults to None."""
-        from sglang.srt.managers.io_struct import GenerateReqInput
-
+        GenerateReqInput = self._import_generate_req_input()
         req = GenerateReqInput(text="test")
         self.assertIsNone(req.output_modality)
 
     def test_output_modality_audio(self):
         """Test setting output_modality to audio."""
-        from sglang.srt.managers.io_struct import GenerateReqInput
-
+        GenerateReqInput = self._import_generate_req_input()
         req = GenerateReqInput(text="test", output_modality="audio")
         self.assertEqual(req.output_modality, "audio")
 

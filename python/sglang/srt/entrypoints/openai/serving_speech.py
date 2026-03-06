@@ -108,10 +108,34 @@ class OpenAIServingSpeech(OpenAIServingBase):
         request: SpeechRequest,
         raw_request: Request = None,
     ) -> tuple[GenerateReqInput, SpeechRequest]:
-        """Convert speech request to internal format."""
+        """Convert speech request to internal format.
+
+        If reference audio is provided, encode it into RVQ codes using
+        the codec before passing to the processor.  The processor will
+        use the pre-encoded tokens to build the voice-clone prompt.
+        """
+        audio_data = None
+        if request.reference_audio_data:
+            try:
+                rvq_codes = self.codec.encode_bytes(request.reference_audio_data)
+                # rvq_codes shape: (1, num_quantizers, seq_len) or (num_quantizers, seq_len)
+                codes = np.array(rvq_codes).squeeze()
+                if codes.ndim == 2:
+                    # Transpose to (T, channels) for the processor
+                    if codes.shape[0] == 16 and codes.shape[1] != 16:
+                        codes = codes.T
+                audio_data = [codes]
+                logger.info(
+                    f"Encoded reference audio: shape={codes.shape}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to encode reference audio, ignoring: {e}"
+                )
+
         adapted_request = GenerateReqInput(
             text=request.input,
-            audio_data=request.reference_audio_data,
+            audio_data=audio_data,
             sampling_params=DEFAULT_TTS_SAMPLING_PARAMS.copy(),
             stream=request.stream,
             modalities=["audio"],

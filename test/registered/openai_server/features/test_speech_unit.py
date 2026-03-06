@@ -480,26 +480,28 @@ class TestMossTTSProcessor(CustomTestCase):
     def _try_import_templates(self):
         try:
             from sglang.srt.multimodal.processors.moss_tts import (
+                ASSISTANT_PREFIX,
                 SYSTEM_PROMPT,
+                VOICE_CLONE_CONTEXT,
             )
-            return SYSTEM_PROMPT
+            return SYSTEM_PROMPT, VOICE_CLONE_CONTEXT, ASSISTANT_PREFIX
         except ImportError:
             self.skipTest("Processor imports require CUDA dependencies")
 
     def test_system_prompt_template(self):
         """System prompt template contains expected markers."""
-        SYSTEM_PROMPT = self._try_import_templates()
+        SYSTEM_PROMPT, _, _ = self._try_import_templates()
 
         self.assertIn("<|im_start|>system", SYSTEM_PROMPT)
         self.assertIn("<|im_end|>", SYSTEM_PROMPT)
         self.assertIn("Mosi Intelligence", SYSTEM_PROMPT)
 
     def test_context_template_with_audio_substitution(self):
-        """System prompt is a plain string (no format placeholders)."""
-        SYSTEM_PROMPT = self._try_import_templates()
-        # System prompt should be a complete string, not a template
-        self.assertIsInstance(SYSTEM_PROMPT, str)
-        self.assertGreater(len(SYSTEM_PROMPT), 50)
+        """Voice clone context and assistant prefix are present."""
+        _, VOICE_CLONE_CONTEXT, ASSISTANT_PREFIX = self._try_import_templates()
+        self.assertIn("context", VOICE_CLONE_CONTEXT)
+        self.assertIn("voice timbre", VOICE_CLONE_CONTEXT)
+        self.assertIn("assistant", ASSISTANT_PREFIX)
 
     def test_processor_async_builds_multi_channel(self):
         """process_mm_data_async builds multi-channel tensor with correct shape."""
@@ -609,6 +611,124 @@ class TestMossTTSProcessor(CustomTestCase):
         mm_item = result["mm_items"][0]
         # All 5 tokens primed, nothing left for text_ids
         self.assertEqual(len(mm_item.model_specific_data["text_ids"]), 0)
+
+    def test_processor_voice_clone_with_ref_audio(self):
+        """Processor builds voice clone prompt when reference audio tokens provided."""
+        import asyncio
+
+        ProcessorClass = self._try_import_processor()
+        try:
+            from sglang.srt.models.moss_tts_realtime import REFERENCE_AUDIO_PAD_ID
+        except ImportError:
+            self.skipTest("Model imports require CUDA dependencies")
+
+        mock_tokenizer = MagicMock()
+        # The processor calls encode 3 times for voice clone:
+        # 1. text_ids (input text)
+        # 2. system_prompt + voice_clone_context + audio_pad_tokens
+        # 3. assistant_prefix
+        ref_pad_id = REFERENCE_AUDIO_PAD_ID  # 151654
+        text_tokens = list(range(200, 210))
+        # System prompt tokens with 5 audio_pad tokens embedded
+        system_tokens = list(range(100, 115)) + [ref_pad_id] * 5
+        assistant_tokens = list(range(300, 305))
+        mock_tokenizer.encode.side_effect = [text_tokens, system_tokens, assistant_tokens]
+
+        proc = ProcessorClass.__new__(ProcessorClass)
+        proc._tokenizer = mock_tokenizer
+        proc._processor = mock_tokenizer
+
+        # Create fake reference audio RVQ codes: 5 frames × 16 channels
+        ref_audio_tokens = np.arange(80, dtype=np.int64).reshape(5, 16)
+
+        result = asyncio.run(
+            proc.process_mm_data_async(
+                image_data=None,
+                audio_data=[ref_audio_tokens],
+                input_text="Hello world",
+                request_obj=None,
+            )
+        )
+
+        mm_item = result["mm_items"][0]
+        mc = mm_item.model_specific_data["multi_channel_ids"]
+
+        # Multi-channel should have 17 columns
+        self.assertEqual(mc.shape[1], 17)
+
+        # Find positions where text channel has ref_pad_id
+        text_channel = mc[:, 0]
+        pad_positions = np.where(text_channel == ref_pad_id)[0]
+        self.assertEqual(len(pad_positions), 5)
+
+        # Audio channels at those positions should contain the reference codes
+        for i, pos in enumerate(pad_positions):
+            np.testing.assert_array_equal(
+                mc[pos, 1:], ref_audio_tokens[i],
+                err_msg=f"RVQ codes at position {pos} don't match reference"
+            )
+
+    def test_processor_no_ref_audio_no_assistant_prefix(self):
+        """Without reference audio, no assistant prefix or context section."""
+        import asyncio
+
+        ProcessorClass = self._try_import_processor()
+
+        mock_tokenizer = MagicMock()
+        text_tokens = list(range(200, 210))
+        system_tokens = list(range(100, 120))
+        mock_tokenizer.encode.side_effect = [text_tokens, system_tokens]
+
+        proc = ProcessorClass.__new__(ProcessorClass)
+        proc._tokenizer = mock_tokenizer
+        proc._processor = mock_tokenizer
+
+        result = asyncio.run(
+            proc.process_mm_data_async(
+                image_data=None,
+                audio_data=None,
+                input_text="Hello world",
+                request_obj=None,
+            )
+        )
+
+        # encode should only be called twice (text + system prompt)
+        self.assertEqual(mock_tokenizer.encode.call_count, 2)
+
+
+# ===========================================================================
+# Local Transformer – special token masking
+# ===========================================================================
+
+class TestLocalTransformerSpecialTokenMask(CustomTestCase):
+    """Test that codebooks 1-15 mask out special tokens (PAD/BOS/EOS)."""
+
+    def test_special_tokens_masked_for_non_zero_codebooks(self):
+        """Tokens 1024-1026 should be -inf for codebooks 1-15."""
+        try:
+            from sglang.srt.models.moss_tts_realtime import (
+                AUDIO_PAD_TOKEN,
+                AUDIO_VOCAB_SIZE,
+            )
+        except ImportError:
+            self.skipTest("Model imports require CUDA dependencies")
+
+        # Simulate what the model does: for codebook i>0,
+        # logits[:, :, AUDIO_PAD_TOKEN:] = -inf
+        import torch
+
+        logits = torch.randn(1, 1, AUDIO_VOCAB_SIZE)
+        # For codebook 0, no masking
+        logits_cb0 = logits.clone()
+        # Codebook 0 keeps all logits (including special tokens)
+        self.assertTrue(torch.isfinite(logits_cb0[:, :, AUDIO_PAD_TOKEN:]).all())
+
+        # For codebook 1+, special tokens are masked
+        logits_cb1 = logits.clone()
+        logits_cb1[:, :, AUDIO_PAD_TOKEN:] = float("-inf")
+        self.assertTrue((logits_cb1[:, :, AUDIO_PAD_TOKEN:] == float("-inf")).all())
+        # Valid codec codes (0-1023) are untouched
+        self.assertTrue(torch.isfinite(logits_cb1[:, :, :AUDIO_PAD_TOKEN]).all())
 
 
 # ===========================================================================

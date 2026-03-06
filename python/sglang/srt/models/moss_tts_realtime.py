@@ -436,6 +436,12 @@ class MossTTSLocalTransformer(nn.Module):
             # Project to audio vocabulary
             logits = self.local_lm_heads[i](h[:, -1:, :])
 
+            # Mask special tokens (PAD/BOS/EOS) for codebooks 1-15.
+            # Only codebook 0 may emit EOS to signal end of generation.
+            # Tokens 1024-1026 are protocol tokens, not valid codec codes.
+            if i > 0:
+                logits[:, :, AUDIO_PAD_TOKEN:] = float("-inf")
+
             # Apply repetition penalty
             if (
                 repetition_penalty

@@ -106,17 +106,13 @@ class AudioCodec:
 
         wav_tensor = wav.unsqueeze(0).to(device)
         encode_result = self.model.encode(wav_tensor)
+        codes = self._extract_audio_codes(encode_result)
 
-        if isinstance(encode_result, dict):
-            codes = encode_result["audio_codes"]
-        elif hasattr(encode_result, "audio_codes"):
-            codes = encode_result.audio_codes
-        else:
-            raise ValueError(
-                "Unsupported codec.encode() result: "
-                "expected dict/object with 'audio_codes'."
-            )
-        return codes.detach().cpu().numpy()
+        # Codec returns (num_quantizers, batch, seq_len); squeeze batch dim
+        result = codes.detach().cpu().numpy()
+        if result.ndim == 3 and result.shape[1] == 1:
+            result = result[:, 0, :]
+        return result
 
     @torch.inference_mode()
     def encode_bytes(self, audio_bytes: bytes) -> np.ndarray:
@@ -139,21 +135,31 @@ class AudioCodec:
         device = next(self.model.parameters()).device
         wav_tensor = audio_tensor.unsqueeze(0).to(device)
         encode_result = self.model.encode(wav_tensor)
+        codes = self._extract_audio_codes(encode_result)
 
+        # Codec returns (num_quantizers, batch, seq_len); squeeze batch dim
+        result = codes.detach().cpu().numpy()
+        if result.ndim == 3 and result.shape[1] == 1:
+            result = result[:, 0, :]
+        return result
+
+    @staticmethod
+    def _extract_audio_codes(encode_result) -> torch.Tensor:
+        """Extract audio_codes tensor from codec encode output."""
+        if isinstance(encode_result, tuple):
+            return encode_result[0]
         if isinstance(encode_result, dict):
-            codes = encode_result["audio_codes"]
-        elif hasattr(encode_result, "audio_codes"):
-            codes = encode_result.audio_codes
-        else:
-            raise ValueError(
-                "Unsupported codec.encode() result: "
-                "expected dict/object with 'audio_codes'."
-            )
-        return codes.detach().cpu().numpy()
+            return encode_result["audio_codes"]
+        if hasattr(encode_result, "audio_codes"):
+            return encode_result.audio_codes
+        raise ValueError(
+            "Unsupported codec.encode() result: "
+            "expected tuple, dict, or object with 'audio_codes'."
+        )
 
     @torch.inference_mode()
     def decode(
-        self, tokens: torch.Tensor, chunk_duration: int = 8
+        self, tokens: torch.Tensor, chunk_duration: float = None
     ) -> torch.Tensor:
         """Decode discrete codec tokens into an audio waveform.
 
@@ -161,8 +167,9 @@ class AudioCodec:
 
         Args:
             tokens: Audio code tokens of shape (num_quantizers, seq_len)
-                or (batch, num_quantizers, seq_len).
-            chunk_duration: Chunk duration for codec decoding.
+                or (num_quantizers, batch, seq_len).
+            chunk_duration: Chunk duration in seconds for streaming codec
+                decoding.  ``None`` (default) uses non-streaming decode.
 
         Returns:
             Audio waveform tensor.
@@ -170,10 +177,12 @@ class AudioCodec:
         device = next(self.model.parameters()).device
         tokens = tokens.to(device)
 
-        decode_result = self.model.decode(
-            tokens.permute(1, 0) if tokens.ndim == 2 else tokens,
-            chunk_duration=chunk_duration,
-        )
+        # The codec expects (num_quantizers, seq_len) for 2-D input or
+        # (num_quantizers, batch, seq_len) for 3-D.  Do NOT permute.
+        decode_kwargs = {}
+        if chunk_duration is not None:
+            decode_kwargs["chunk_duration"] = chunk_duration
+        decode_result = self.model.decode(tokens, **decode_kwargs)
 
         if isinstance(decode_result, dict):
             audio = decode_result["audio"]
@@ -189,7 +198,7 @@ class AudioCodec:
         self,
         tokens: torch.Tensor,
         chunk_size: int = 50,
-        chunk_duration: int = 8,
+        chunk_duration: float = None,
     ) -> Iterator[torch.Tensor]:
         """Decode tokens in chunks for streaming audio output.
 
@@ -211,7 +220,7 @@ class AudioCodec:
     def decode_rvq_codes(
         self,
         rvq_codes: list,
-        chunk_duration: int = 8,
+        chunk_duration: float = None,
     ) -> np.ndarray:
         """Decode full multi-codebook RVQ codes to audio.
 
@@ -277,7 +286,7 @@ class AudioCodec:
         self,
         token_ids: list,
         num_codebooks: int = 16,
-        chunk_duration: int = 8,
+        chunk_duration: float = None,
     ) -> np.ndarray:
         """Decode a flat list of first-codebook token IDs to audio.
 

@@ -54,6 +54,7 @@ DEFAULT_TTS_SAMPLING_PARAMS = {
     "top_k": 30,
     "repetition_penalty": 1.1,
     "max_new_tokens": 5000,  # ~40 seconds of audio
+    "stop_token_ids": [1026],  # Audio EOS token — stop when codebook-0 emits EOS
 }
 
 

@@ -322,7 +322,7 @@ class TestAudioCodecDecodeRvqCodes(CustomTestCase):
         self.assertEqual(len(result), 0)
 
     def test_decode_rvq_codes_builds_correct_shape(self):
-        """Tensor passed to codec model has correct shape after permutation."""
+        """Tensor passed to codec model has correct shape (num_codebooks, seq_len)."""
         from sglang.srt.audio.codec import AudioCodec
 
         mock = _make_mock_codec_model()
@@ -332,9 +332,9 @@ class TestAudioCodecDecodeRvqCodes(CustomTestCase):
         )
         self.assertTrue(mock.decode.called)
         codes_arg = mock.decode.call_args[0][0]
-        # decode() permutes (num_codebooks, seq_len) → (seq_len, num_codebooks)
-        self.assertEqual(codes_arg.shape[0], 2)   # 2 time steps
-        self.assertEqual(codes_arg.shape[1], 16)   # 16 codebooks
+        # decode() passes (num_codebooks, seq_len) directly — no permutation
+        self.assertEqual(codes_arg.shape[0], 16)   # 16 codebooks
+        self.assertEqual(codes_arg.shape[1], 2)    # 2 time steps
 
     def test_decode_rvq_codes_single_codebook_fallback(self):
         """Single integers (not lists) are treated as single-codebook input."""
@@ -357,7 +357,8 @@ class TestAudioCodecDecodeRvqCodes(CustomTestCase):
             [200] + [0] * 15,    # valid
         ])
         codes_arg = mock.decode.call_args[0][0]
-        self.assertEqual(codes_arg.shape[0], 2)  # only 2 valid steps
+        self.assertEqual(codes_arg.shape[0], 16)  # 16 codebooks
+        self.assertEqual(codes_arg.shape[1], 2)   # only 2 valid steps
 
     def test_decode_rvq_codes_returns_float32(self):
         """Output waveform is float32 numpy array."""

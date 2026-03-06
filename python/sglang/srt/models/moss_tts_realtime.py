@@ -59,48 +59,285 @@ REFERENCE_AUDIO_PAD_ID = 151654
 TEXT_PAD_ID = 151655
 
 
-class MossTTSLocalTransformer(nn.Module):
-    """Local transformer for generating RVQ audio codes.
+# =====================================================================
+# Local transformer for RVQ codebook generation
+# (inference-only reimplementation of MossTTSRealtimeLocalTransformerForCausalLM)
+# =====================================================================
 
-    A small 4-layer transformer that autoregressively generates 16 RVQ
-    codebook tokens conditioned on the backbone's hidden state.
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def _apply_rotary_pos_emb(
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    cos = cos.unsqueeze(1)  # (batch, 1, seq, dim)
+    sin = sin.unsqueeze(1)
+    q_embed = (q * cos) + (_rotate_half(q) * sin)
+    k_embed = (k * cos) + (_rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    if n_rep == 1:
+        return hidden_states
+    b, h, s, d = hidden_states.shape
+    hidden_states = hidden_states[:, :, None, :, :].expand(b, h, n_rep, s, d)
+    return hidden_states.reshape(b, h * n_rep, s, d)
+
+
+class _LocalRMSNorm(nn.Module):
+    """RMSNorm (matches MossTTSRealtimeLocalTransformerRMSNorm weights)."""
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(
+            variance + self.variance_epsilon
+        )
+        return self.weight * hidden_states.to(input_dtype)
+
+
+class _LocalMLP(nn.Module):
+    """MLP (matches MossTTSRealtimeLocalTransformerMLP weights)."""
+
+    def __init__(self, hidden_size: int, intermediate_size: int):
+        super().__init__()
+        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+class _LocalRotaryEmbedding(nn.Module):
+    """Rotary embedding (matches MossTTSRealtimeLocalTransformerRotaryEmbedding)."""
+
+    inv_freq: torch.Tensor
+
+    def __init__(self, head_dim: int, rope_theta: float = 1000000.0):
+        super().__init__()
+        inv_freq = 1.0 / (
+            rope_theta
+            ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
+        )
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    @torch.no_grad()
+    def forward(
+        self, x: torch.Tensor, position_ids: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        inv_freq_expanded = (
+            self.inv_freq[None, :, None]
+            .float()
+            .expand(position_ids.shape[0], -1, 1)
+            .to(x.device)
+        )
+        position_ids_expanded = position_ids[:, None, :].float()
+        device_type = (
+            x.device.type
+            if isinstance(x.device.type, str) and x.device.type != "mps"
+            else "cpu"
+        )
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (
+                inv_freq_expanded.float() @ position_ids_expanded.float()
+            ).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos()
+            sin = emb.sin()
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
+class _LocalAttention(nn.Module):
+    """Attention with QK-norm (matches MossTTSRealtimeLocalTransformerAttention)."""
+
+    def __init__(self, config, layer_idx: int):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
+        self.num_heads = config.num_attention_heads
+        self.num_kv_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_kv_heads
+        self.scaling = self.head_dim**-0.5
+
+        bias = getattr(config, "attention_bias", False)
+        self.q_proj = nn.Linear(
+            config.hidden_size, self.num_heads * self.head_dim, bias=bias
+        )
+        self.k_proj = nn.Linear(
+            config.hidden_size, self.num_kv_heads * self.head_dim, bias=bias
+        )
+        self.v_proj = nn.Linear(
+            config.hidden_size, self.num_kv_heads * self.head_dim, bias=bias
+        )
+        self.o_proj = nn.Linear(
+            self.num_heads * self.head_dim, config.hidden_size, bias=bias
+        )
+        eps = getattr(config, "rms_norm_eps", 1e-6)
+        self.q_norm = _LocalRMSNorm(self.head_dim, eps=eps)
+        self.k_norm = _LocalRMSNorm(self.head_dim, eps=eps)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        kv_cache: Tuple[torch.Tensor, torch.Tensor],
+        step_idx: int,
+        causal_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        bsz = hidden_states.shape[0]
+        hidden_shape = (bsz, 1, -1, self.head_dim)
+
+        q = self.q_norm(self.q_proj(hidden_states).view(hidden_shape))
+        k = self.k_norm(self.k_proj(hidden_states).view(hidden_shape))
+        v = self.v_proj(hidden_states).view(hidden_shape)
+
+        q = q.transpose(1, 2)  # (batch, num_heads, 1, head_dim)
+        k = k.transpose(1, 2)  # (batch, kv_heads, 1, head_dim)
+        v = v.transpose(1, 2)
+
+        cos, sin = position_embeddings
+        q, k = _apply_rotary_pos_emb(q, k, cos, sin)
+
+        # Write to pre-allocated KV cache
+        key_cache, value_cache = kv_cache
+        key_cache[:, :, step_idx : step_idx + 1] = k
+        value_cache[:, :, step_idx : step_idx + 1] = v
+
+        # GQA: expand KV heads to match query heads
+        k_full = _repeat_kv(key_cache, self.num_key_value_groups)
+        v_full = _repeat_kv(value_cache, self.num_key_value_groups)
+
+        # Scaled dot-product attention with causal mask
+        attn_weights = (
+            torch.matmul(q, k_full.transpose(2, 3)) * self.scaling
+        )
+        attn_weights = (
+            attn_weights + causal_mask[:, :, step_idx : step_idx + 1, :]
+        )
+        attn_weights = F.softmax(
+            attn_weights, dim=-1, dtype=torch.float32
+        ).to(q.dtype)
+
+        attn_output = torch.matmul(attn_weights, v_full)
+        attn_output = attn_output.transpose(1, 2).reshape(bsz, 1, -1)
+        return self.o_proj(attn_output)
+
+
+class _LocalDecoderLayer(nn.Module):
+    """Decoder layer (matches MossTTSRealtimeLocalTransformerDecoderLayer)."""
+
+    def __init__(self, config, layer_idx: int):
+        super().__init__()
+        self.self_attn = _LocalAttention(config, layer_idx)
+        self.mlp = _LocalMLP(config.hidden_size, config.intermediate_size)
+        eps = getattr(config, "rms_norm_eps", 1e-6)
+        self.input_layernorm = _LocalRMSNorm(config.hidden_size, eps=eps)
+        self.post_attention_layernorm = _LocalRMSNorm(
+            config.hidden_size, eps=eps
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        kv_cache: Tuple[torch.Tensor, torch.Tensor],
+        step_idx: int,
+        causal_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(
+            hidden_states, position_embeddings, kv_cache, step_idx, causal_mask
+        )
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states
+
+
+class _LocalTransformerModel(nn.Module):
+    """Base model (matches MossTTSRealtimeLocalTransformer).
+
+    Weight prefix: ``local_transformer.model.*``
     """
 
-    def __init__(self, config: PretrainedConfig):
+    def __init__(self, config):
+        super().__init__()
+        self.num_codebooks = getattr(config, "rvq", NUM_RVQ_CHANNELS)
+        self.hidden_size = config.hidden_size
+        self.num_kv_heads = config.num_key_value_heads
+        self.head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
+
+        audio_vocab = getattr(config, "audio_vocab_size", AUDIO_VOCAB_SIZE)
+        audio_pad = getattr(config, "audio_pad_token", AUDIO_PAD_TOKEN)
+        # rvq - 1 = 15 embeddings: codebooks 1..15 (codebook 0 uses backbone hidden)
+        self.embed_tokens = nn.ModuleList(
+            [
+                nn.Embedding(audio_vocab, self.hidden_size, audio_pad)
+                for _ in range(self.num_codebooks - 1)
+            ]
+        )
+
+        self.layers = nn.ModuleList(
+            [
+                _LocalDecoderLayer(config, i)
+                for i in range(config.num_hidden_layers)
+            ]
+        )
+        eps = getattr(config, "rms_norm_eps", 1e-6)
+        self.norm = _LocalRMSNorm(self.hidden_size, eps=eps)
+
+        rope_theta = getattr(config, "rope_theta", 1000000.0)
+        self.rotary_emb = _LocalRotaryEmbedding(self.head_dim, rope_theta)
+
+
+class MossTTSLocalTransformer(nn.Module):
+    """CausalLM wrapper (matches MossTTSRealtimeLocalTransformerForCausalLM).
+
+    Wraps ``_LocalTransformerModel`` and adds per-codebook LM heads.
+    Autoregressively generates all 16 RVQ codes for a single backbone step
+    using KV-cached attention across codebook positions.
+
+    Weight prefix: ``local_transformer.*``
+      - ``local_transformer.model.*`` → ``_LocalTransformerModel``
+      - ``local_transformer.local_lm_heads.*`` → per-codebook heads
+    """
+
+    def __init__(self, config):
         super().__init__()
         self.config = config
         self.num_codebooks = getattr(config, "rvq", NUM_RVQ_CHANNELS)
-        self.audio_vocab_size = getattr(config, "audio_vocab_size", AUDIO_VOCAB_SIZE)
+        self.audio_vocab_size = getattr(
+            config, "audio_vocab_size", AUDIO_VOCAB_SIZE
+        )
         self.hidden_size = config.hidden_size
 
-        # Per-codebook embedding and head
-        self.embed_tokens = nn.ModuleList(
-            [
-                nn.Embedding(self.audio_vocab_size, self.hidden_size)
-                for _ in range(self.num_codebooks)
-            ]
-        )
-        self.lm_heads = nn.ModuleList(
+        self.model = _LocalTransformerModel(config)
+        self.local_lm_heads = nn.ModuleList(
             [
                 nn.Linear(self.hidden_size, self.audio_vocab_size, bias=False)
                 for _ in range(self.num_codebooks)
             ]
         )
-
-        # Transformer layers
-        from transformers.models.qwen3.modeling_qwen3 import (
-            Qwen3DecoderLayer,
-            Qwen3RotaryEmbedding,
-        )
-
-        self.layers = nn.ModuleList(
-            [
-                Qwen3DecoderLayer(config, layer_idx=i)
-                for i in range(config.num_hidden_layers)
-            ]
-        )
-        self.rotary_emb = Qwen3RotaryEmbedding(config=config)
-        self.norm = nn.RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -113,52 +350,98 @@ class MossTTSLocalTransformer(nn.Module):
         generated_history: Optional[torch.Tensor] = None,
         gen_step: int = 0,
     ) -> torch.Tensor:
-        """Generate all RVQ codes for one backbone step.
+        """Autoregressively generate all RVQ codes for one backbone step.
 
         Args:
-            backbone_hidden: Hidden state from backbone, shape (batch, 1, hidden).
+            backbone_hidden: (batch, 1, hidden_size) from backbone.
             temperature: Sampling temperature.
             top_p: Nucleus sampling threshold.
             top_k: Top-k sampling parameter.
             repetition_penalty: Repetition penalty factor.
-            repetition_window: Window size for repetition penalty.
-            generated_history: Previously generated tokens for repetition
-                penalty, shape (batch, num_steps, num_codebooks).
+            repetition_window: Window for repetition penalty.
+            generated_history: Previous codes for rep. penalty,
+                shape (batch, num_steps, num_codebooks).
             gen_step: Current generation step index.
 
         Returns:
-            Generated audio codes, shape (batch, num_codebooks).
+            Audio codes tensor of shape (batch, num_codebooks).
         """
         batch_size = backbone_hidden.shape[0]
         device = backbone_hidden.device
+        dtype = backbone_hidden.dtype
+
         output_tokens = torch.empty(
             batch_size, self.num_codebooks, dtype=torch.long, device=device
         )
 
-        hidden = backbone_hidden  # (batch, 1, hidden_size)
+        # Pre-allocate KV caches for all layers
+        num_layers = len(self.model.layers)
+        kv_caches: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        for _ in range(num_layers):
+            k = torch.zeros(
+                batch_size,
+                self.model.num_kv_heads,
+                self.num_codebooks,
+                self.model.head_dim,
+                device=device,
+                dtype=dtype,
+            )
+            v = torch.zeros_like(k)
+            kv_caches.append((k, v))
 
-        # Compute position embeddings once — each codebook step processes
-        # a single token independently (no KV cache), so position is always 0
-        position_ids = torch.zeros(
-            batch_size, 1, dtype=torch.long, device=device
+        # Pre-compute causal mask: (1, 1, max_seq, max_seq)
+        causal_mask = (
+            torch.triu(
+                torch.full(
+                    (self.num_codebooks, self.num_codebooks),
+                    float("-inf"),
+                    device=device,
+                    dtype=dtype,
+                ),
+                diagonal=1,
+            )
+            .unsqueeze(0)
+            .unsqueeze(0)
         )
-        position_embeddings = self.rotary_emb(hidden, position_ids)
+
+        # Pre-compute all position embeddings: (1, num_codebooks, head_dim)
+        all_positions = torch.arange(
+            self.num_codebooks, device=device, dtype=torch.long
+        ).unsqueeze(0)
+        all_cos, all_sin = self.model.rotary_emb(
+            backbone_hidden, all_positions
+        )
 
         for i in range(self.num_codebooks):
-            # Run through transformer layers
-            h = hidden
-            for layer in self.layers:
-                h = layer(h, position_embeddings=position_embeddings)[0]
-            h = self.norm(h)
+            # Input: backbone hidden for codebook 0, else embed prev code
+            if i == 0:
+                hidden = backbone_hidden  # (batch, 1, hidden)
+            else:
+                hidden = self.model.embed_tokens[i - 1](
+                    output_tokens[:, i - 1 : i]
+                )
 
-            # Get logits for this codebook
-            logits = self.lm_heads[i](h[:, -1:, :])  # (batch, 1, vocab)
+            # Position embeddings for this step
+            cos_i = all_cos[:, i : i + 1]
+            sin_i = all_sin[:, i : i + 1]
+
+            # Run through decoder layers with KV cache
+            h = hidden
+            for layer_idx, layer in enumerate(self.model.layers):
+                h = layer(
+                    h, (cos_i, sin_i), kv_caches[layer_idx], i, causal_mask
+                )
+            h = self.model.norm(h)
+
+            # Project to audio vocabulary
+            logits = self.local_lm_heads[i](h[:, -1:, :])
 
             # Apply repetition penalty
             if (
                 repetition_penalty
                 and repetition_penalty != 1.0
                 and generated_history is not None
+                and gen_step > 0
             ):
                 logits = self._apply_repetition_penalty(
                     logits,
@@ -167,14 +450,9 @@ class MossTTSLocalTransformer(nn.Module):
                     repetition_window,
                 )
 
-            # Sample token
+            # Sample
             token = self._sample(logits, temperature, top_p, top_k)
             output_tokens[:, i] = token.squeeze(-1)
-
-            # Next codebook input: embed the sampled token
-            if i < self.num_codebooks - 1:
-                token_embed = self.embed_tokens[i + 1](token)  # (batch, 1, hidden)
-                hidden = token_embed
 
         return output_tokens
 
@@ -192,15 +470,17 @@ class MossTTSLocalTransformer(nn.Module):
         logits = logits / temperature
         logits = logits.squeeze(1)  # (batch, vocab)
 
-        # Top-k filtering
         if top_k > 0:
             top_k = min(top_k, logits.shape[-1])
-            threshold = torch.topk(logits, top_k, dim=-1).values[..., -1, None]
+            threshold = torch.topk(logits, top_k, dim=-1).values[
+                ..., -1, None
+            ]
             logits = logits.masked_fill(logits < threshold, float("-inf"))
 
-        # Top-p filtering
         if top_p < 1.0:
-            sorted_logits, sorted_indices = torch.sort(logits, descending=False)
+            sorted_logits, sorted_indices = torch.sort(
+                logits, descending=False
+            )
             cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
             sorted_mask = cumulative_probs <= (1 - top_p)
             mask = torch.zeros_like(logits, dtype=torch.bool).scatter(
@@ -219,7 +499,7 @@ class MossTTSLocalTransformer(nn.Module):
         window: int,
     ) -> torch.Tensor:
         """Apply repetition penalty over a sliding window."""
-        scores = logits.squeeze(1)  # (batch, vocab)
+        scores = logits.squeeze(1)
         if window and window > 0:
             history = history[:, -window:]
         cur = scores.gather(1, history)

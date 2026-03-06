@@ -712,6 +712,11 @@ class ServerArgs:
     limit_mm_data_per_request: Optional[Union[str, Dict[str, int]]] = None
     enable_mm_global_cache: bool = False
 
+    # For Text-to-Speech (TTS)
+    codec_path: Optional[str] = None
+    tts_sample_rate: int = 24000
+    voice_dir: Optional[str] = None
+
     # For checkpoint decryption
     decrypted_config_file: Optional[str] = None
     decrypted_draft_config_file: Optional[str] = None
@@ -5435,6 +5440,26 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_mm_global_cache,
             help="Enable global multimodal embedding cache to skip redundant ViT inference.",
+        )
+
+        # For Text-to-Speech (TTS)
+        parser.add_argument(
+            "--codec-path",
+            type=str,
+            default=ServerArgs.codec_path,
+            help="Path to audio codec model (e.g., MOSS-Audio-Tokenizer) for TTS decoding.",
+        )
+        parser.add_argument(
+            "--tts-sample-rate",
+            type=int,
+            default=ServerArgs.tts_sample_rate,
+            help="Output audio sample rate for TTS models (default: 24000).",
+        )
+        parser.add_argument(
+            "--voice-dir",
+            type=str,
+            default=ServerArgs.voice_dir,
+            help="Directory containing pre-registered voice reference audio files for TTS.",
         )
 
         # For registering hooks

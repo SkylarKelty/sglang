@@ -164,6 +164,8 @@ class GenerateReqInput(BaseReq):
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
+    # The expected output modality ("text" by default, "audio" for TTS)
+    output_modality: Optional[str] = None
     # Session info for continual prompting
     session_params: Optional[Union[List[Dict], Dict]] = None
 

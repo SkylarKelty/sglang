@@ -177,6 +177,7 @@ class ModelConfig:
         self.is_audio_model = enable_multimodal and is_audio_model(
             self.hf_config.architectures
         )
+        self.is_tts_model = is_tts_model(self.hf_config.architectures)
         # TODO: requires further polishing
         self.is_image_understandable_model = enable_multimodal and hasattr(
             self.hf_config, "vision_config"
@@ -1353,6 +1354,13 @@ def is_image_gen_model(model_architectures: List[str]):
 def is_audio_model(model_architectures: List[str]):
     models = [
         "WhisperForConditionalGeneration",
+    ]
+    return any(model in model_architectures for model in models)
+
+
+def is_tts_model(model_architectures: List[str]):
+    models = [
+        "MossTTSRealtimeForCausalLM",
     ]
     return any(model in model_architectures for model in models)
 

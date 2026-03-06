@@ -89,6 +89,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ModelList,
     ResponsesRequest,
     ScoringRequest,
+    SpeechRequest,
     TokenizeRequest,
     V1RerankReqInput,
 )
@@ -104,6 +105,9 @@ from sglang.srt.entrypoints.openai.serving_tokenize import (
 )
 from sglang.srt.entrypoints.openai.serving_transcription import (
     OpenAIServingTranscription,
+)
+from sglang.srt.entrypoints.openai.serving_speech import (
+    OpenAIServingSpeech,
 )
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
@@ -318,6 +322,29 @@ async def lifespan(fast_api_app: FastAPI):
     fast_api_app.state.openai_serving_transcription = OpenAIServingTranscription(
         _global_state.tokenizer_manager
     )
+
+    # Initialize TTS speech serving handler if model supports it
+    if getattr(_global_state.tokenizer_manager.model_config, "is_tts_model", False):
+        from sglang.srt.audio.codec import AudioCodec
+
+        server_args = _global_state.tokenizer_manager.server_args
+        codec_path = server_args.codec_path
+        if not codec_path:
+            logger.warning(
+                "TTS model detected but --codec-path not provided. "
+                "The /v1/audio/speech endpoint will not be available. "
+                "Set --codec-path to a MOSS-Audio-Tokenizer model path to enable TTS."
+            )
+            fast_api_app.state.openai_serving_speech = None
+        else:
+            codec = AudioCodec.load(codec_path=codec_path)
+            fast_api_app.state.openai_serving_speech = OpenAIServingSpeech(
+                _global_state.tokenizer_manager,
+                codec=codec,
+                sample_rate=server_args.tts_sample_rate,
+            )
+    else:
+        fast_api_app.state.openai_serving_speech = None
 
     # Initialize Ollama-compatible serving handler
     fast_api_app.state.ollama_serving = OllamaServing(_global_state.tokenizer_manager)
@@ -1501,6 +1528,31 @@ async def openai_v1_audio_transcriptions(
             stream=stream,
             raw_request=raw_request,
         )
+    )
+
+
+@app.post("/v1/audio/speech")
+async def openai_v1_audio_speech(
+    raw_request: Request,
+    request: SpeechRequest,
+):
+    """OpenAI-compatible speech synthesis endpoint."""
+    serving_speech = raw_request.app.state.openai_serving_speech
+    if serving_speech is None:
+        return ORJSONResponse(
+            content={
+                "error": {
+                    "message": "Speech synthesis is not available. "
+                    "The loaded model does not support TTS.",
+                    "type": "invalid_request_error",
+                }
+            },
+            status_code=400,
+        )
+
+    return await serving_speech.create_speech(
+        request=request,
+        raw_request=raw_request,
     )
 
 

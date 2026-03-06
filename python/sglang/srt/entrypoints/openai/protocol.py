@@ -1469,3 +1469,20 @@ class TranscriptionStreamResponse(BaseModel):
     model: str
     choices: List[TranscriptionStreamChoice]
     usage: Optional[UsageInfo] = None
+
+
+# ================== Speech (TTS) API Protocol Definitions ==================
+
+
+class SpeechRequest(BaseModel):
+    """Request model for speech synthesis (OpenAI-compatible /v1/audio/speech)."""
+
+    model: str = DEFAULT_MODEL_NAME
+    input: str  # Text to synthesize (max 4096 chars)
+    voice: str = "default"  # Voice name or reference audio path/URL
+    response_format: str = "wav"  # wav, mp3, opus, flac, aac, pcm
+    speed: float = 1.0  # Not supported by MOSS-TTS-Realtime (ignored)
+    instructions: Optional[str] = None  # Not supported (ignored)
+    stream: bool = False
+    # Internal fields (not from API)
+    reference_audio_data: Optional[bytes] = None

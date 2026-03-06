@@ -244,7 +244,11 @@ class MossTTSRealtime(nn.Module):
 
         local_config = config.local_config
         if isinstance(local_config, dict):
-            local_config = PretrainedConfig(**local_config)
+            from sglang.srt.configs.moss_tts_realtime import (
+                MossTTSRealtimeLocalTransformerConfig,
+            )
+
+            local_config = MossTTSRealtimeLocalTransformerConfig(**local_config)
 
         # Text embedding + audio channel embeddings (17 total)
         self.embed_tokens = nn.ModuleList()

@@ -70,6 +70,8 @@ class MossTTSRealtimeLocalTransformerConfig(PretrainedConfig):
         self.audio_pad_token = 1024
         self.audio_vocab_size = 1027
         self.rvq = 16
+        # Qwen3DecoderLayer requires layer_types for attention type dispatch
+        self.layer_types = ["full_attention"] * self.num_hidden_layers
 
 
 class MossTTSRealtimeConfig(PretrainedConfig):

@@ -268,10 +268,13 @@ class MossTTSRealtime(nn.Module):
                 )
             )
 
-        # Backbone: Qwen3 model (without lm_head)
-        from transformers.models.qwen3 import Qwen3Model
+        # Backbone: SGLang's Qwen3 model (paged attention + KV cache)
+        from sglang.srt.models.qwen3 import Qwen3Model as SglangQwen3Model
 
-        self.language_model = Qwen3Model(lang_config)
+        self.language_model = SglangQwen3Model(
+            lang_config, quant_config=quant_config, prefix="language_model"
+        )
+        self.hidden_size = lang_config.hidden_size
 
         # Local transformer for RVQ code generation
         self.local_transformer = MossTTSLocalTransformer(local_config)
@@ -345,63 +348,70 @@ class MossTTSRealtime(nn.Module):
     ) -> LogitsProcessorOutput:
         """Prefill: process the full prompt and generate first audio codes.
 
-        Reads multi_channel_ids, text_ids, and text_cursor from the
-        MultimodalDataItem's model_specific_data (set by MossTTSProcessor).
+        Uses SGLang's flat token representation: input_ids is (total_tokens,)
+        across all requests in the batch. Multi-channel audio embeddings are
+        scattered per-request using extend_start_loc offsets.
         """
         device = input_ids.device
         batch_size = forward_batch.batch_size
 
-        # Extract multi-channel IDs and text queue from mm_inputs
-        multi_channel_ids = None
-        if forward_batch.mm_inputs:
-            for idx, mm_input in enumerate(forward_batch.mm_inputs):
-                if mm_input is None:
-                    continue
-                for mm_item in getattr(mm_input, "mm_items", []):
+        # Text embeddings for all tokens (flat representation)
+        input_embeds = self.embed_tokens[0](input_ids)  # (total_tokens, hidden)
+
+        # Per-request token ranges for embedding scatter
+        start_loc = forward_batch.extend_start_loc.cpu().numpy()
+        seq_lens = forward_batch.extend_seq_lens.cpu().numpy()
+
+        # Add audio channel embeddings and extract per-request state
+        for idx in range(batch_size):
+            req_idx = forward_batch.req_pool_indices[idx].item()
+            self._generated_history[req_idx] = []
+
+            mm = None
+            if forward_batch.mm_inputs and idx < len(forward_batch.mm_inputs):
+                mm = forward_batch.mm_inputs[idx]
+
+            if mm is not None:
+                for mm_item in getattr(mm, "mm_items", []):
                     msd = getattr(mm_item, "model_specific_data", {})
+
+                    # Scatter audio channel embeddings (channels 1..16)
                     if "multi_channel_ids" in msd:
                         mc = msd["multi_channel_ids"]
                         if not isinstance(mc, torch.Tensor):
-                            mc = torch.tensor(mc, dtype=torch.long, device=device)
-                        # Add batch dim if needed
-                        if mc.ndim == 2:
-                            mc = mc.unsqueeze(0)
-                        multi_channel_ids = mc
+                            mc = torch.tensor(
+                                mc, dtype=torch.long, device=device
+                            )
+                        start = int(start_loc[idx])
+                        length = int(seq_lens[idx])
+                        mc = mc[:length]
+                        for ch in range(
+                            1, min(mc.shape[-1], len(self.embed_tokens))
+                        ):
+                            input_embeds[start : start + length] += (
+                                self.embed_tokens[ch](mc[:, ch])
+                            )
 
-        if multi_channel_ids is not None:
-            input_embeds = self.get_input_embeddings(multi_channel_ids)
-        else:
-            input_embeds = self.embed_tokens[0](input_ids)
+                    # Store text queue and cursor for decode phase
+                    if "text_ids" in msd:
+                        self._text_queue[req_idx] = list(msd["text_ids"])
+                        self._text_cursor[req_idx] = int(
+                            msd.get("text_cursor", 0)
+                        )
+                    break
 
-        # Run backbone
-        outputs = self.language_model(
-            inputs_embeds=input_embeds,
-            use_cache=False,
+        # Run backbone with SGLang's paged attention
+        hidden_states = self.language_model(
+            input_ids, positions, forward_batch, input_embeds=input_embeds
         )
-        hidden_states = outputs.last_hidden_state
+        # hidden_states: (total_tokens, hidden_size)
 
-        # Get last hidden for local transformer
-        backbone_h = hidden_states[:, -1:, :]
-
-        # Store per-request state (text queue + cursor from processor)
-        if forward_batch.req_pool_indices is not None:
-            for idx, req_idx in enumerate(
-                forward_batch.req_pool_indices.tolist()
-            ):
-                self._generated_history[req_idx] = []
-
-                # Extract text_ids and text_cursor from mm_inputs
-                if forward_batch.mm_inputs and idx < len(forward_batch.mm_inputs):
-                    mm = forward_batch.mm_inputs[idx]
-                    if mm is not None:
-                        for mm_item in getattr(mm, "mm_items", []):
-                            msd = getattr(mm_item, "model_specific_data", {})
-                            if "text_ids" in msd:
-                                self._text_queue[req_idx] = list(msd["text_ids"])
-                                self._text_cursor[req_idx] = int(
-                                    msd.get("text_cursor", 0)
-                                )
-                                break
+        # Extract last hidden state per request
+        last_positions = [
+            int(start_loc[idx] + seq_lens[idx] - 1)
+            for idx in range(batch_size)
+        ]
+        backbone_h = hidden_states[last_positions].unsqueeze(1)  # (batch, 1, hidden)
 
         # Run local transformer to get first audio codes
         audio_codes = self.local_transformer.forward(
@@ -412,12 +422,10 @@ class MossTTSRealtime(nn.Module):
         )
 
         # Store audio codes per request
-        if forward_batch.req_pool_indices is not None:
-            for idx, req_idx in enumerate(
-                forward_batch.req_pool_indices.tolist()
-            ):
-                self._prev_audio_codes[req_idx] = audio_codes[idx]
-                self._generated_history[req_idx].append(audio_codes[idx])
+        for idx in range(batch_size):
+            req_idx = forward_batch.req_pool_indices[idx].item()
+            self._prev_audio_codes[req_idx] = audio_codes[idx]
+            self._generated_history[req_idx].append(audio_codes[idx])
 
         # Return first codebook logits (one-hot so SGLang picks the same
         # token the local transformer already sampled) PLUS all 16 RVQ
@@ -430,7 +438,6 @@ class MossTTSRealtime(nn.Module):
         )
         logits.scatter_(1, first_codes.unsqueeze(1), 100.0)
 
-        # Pack all 16 codes per request into customized_info
         all_codes_list = [
             audio_codes[i].tolist() for i in range(batch_size)
         ]
@@ -448,49 +455,57 @@ class MossTTSRealtime(nn.Module):
     ) -> LogitsProcessorOutput:
         """Decode: generate next audio codes given previous step.
 
-        Constructs multi-channel input from text queue + previous audio
-        codes, runs backbone + local transformer, and returns all 16 RVQ
-        codes via customized_info for faithful codec decoding.
+        Constructs multi-channel embeddings from text queue + previous audio
+        codes as a flat (batch_size, hidden_size) tensor for SGLang's decode.
         """
         batch_size = forward_batch.batch_size
         device = input_ids.device
+        dtype = self.embed_tokens[0].weight.dtype
 
-        # Construct multi-channel input: [text_token, prev_16_audio_codes]
-        step_ids = torch.full(
-            (batch_size, 1, 1 + self.num_rvq),
-            AUDIO_PAD_TOKEN,
-            dtype=torch.long,
-            device=device,
+        # Construct multi-channel embeddings: (batch_size, hidden_size)
+        input_embeds = torch.zeros(
+            batch_size, self.hidden_size, device=device, dtype=dtype
         )
 
         if forward_batch.req_pool_indices is not None:
-            for idx, req_idx in enumerate(
-                forward_batch.req_pool_indices.tolist()
-            ):
-                # Get next text token from the queue
+            for idx in range(batch_size):
+                req_idx = forward_batch.req_pool_indices[idx].item()
+
+                # Text channel (channel 0)
+                text_token = TEXT_PAD_ID
                 if req_idx in self._text_queue and req_idx in self._text_cursor:
                     cursor = self._text_cursor[req_idx]
                     text_ids = self._text_queue[req_idx]
                     if cursor < len(text_ids):
-                        step_ids[idx, 0, 0] = text_ids[cursor]
+                        text_token = text_ids[cursor]
                         self._text_cursor[req_idx] = cursor + 1
-                    else:
-                        step_ids[idx, 0, 0] = TEXT_PAD_ID
 
-                # Fill previous audio codes into channels 1..16
+                text_id = torch.tensor(
+                    [text_token], device=device, dtype=torch.long
+                )
+                embed = self.embed_tokens[0](text_id)  # (1, hidden)
+
+                # Audio channels (1..16)
                 if req_idx in self._prev_audio_codes:
-                    step_ids[idx, 0, 1:] = self._prev_audio_codes[req_idx]
+                    prev_codes = self._prev_audio_codes[req_idx]
+                    for ch in range(self.num_rvq):
+                        code_id = prev_codes[ch : ch + 1]  # (1,)
+                        embed = embed + self.embed_tokens[ch + 1](code_id)
+                else:
+                    pad_id = torch.tensor(
+                        [AUDIO_PAD_TOKEN], device=device, dtype=torch.long
+                    )
+                    for ch in range(self.num_rvq):
+                        embed = embed + self.embed_tokens[ch + 1](pad_id)
 
-        # Compute summed multi-channel embeddings
-        input_embeds = self.get_input_embeddings(step_ids)
+                input_embeds[idx] = embed.squeeze(0)
 
-        # Run backbone (KV cached)
-        outputs = self.language_model(
-            inputs_embeds=input_embeds.squeeze(1),
-            use_cache=True,
+        # Run backbone with KV cache
+        hidden_states = self.language_model(
+            input_ids, positions, forward_batch, input_embeds=input_embeds
         )
-        hidden_states = outputs.last_hidden_state
-        backbone_h = hidden_states[:, -1:, :]
+        # hidden_states: (batch_size, hidden_size)
+        backbone_h = hidden_states.unsqueeze(1)  # (batch, 1, hidden)
 
         # Build history tensor for repetition penalty
         gen_history = None
@@ -581,28 +596,62 @@ class MossTTSRealtime(nn.Module):
         """Load model weights from checkpoint.
 
         Maps MOSS-TTS-Realtime weight names to this model's structure.
+        Handles stacked Q/K/V → qkv_proj and gate/up → gate_up_proj
+        for the SGLang backbone.
         """
+        from sglang.srt.model_loader.weight_utils import default_weight_loader
+
+        stacked_params_mapping = [
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+
         params_dict = dict(self.named_parameters())
         loaded: Set[str] = set()
 
         for name, loaded_weight in weights:
-            # Map weight names
-            param_name = name
+            # Skip non-parameter cached tensors
+            if "rotary_emb.inv_freq" in name:
+                continue
 
-            if param_name in params_dict:
-                param = params_dict[param_name]
-                weight_loader = getattr(param, "weight_loader", None)
-                if weight_loader:
-                    weight_loader(param, loaded_weight)
-                else:
-                    param.data.copy_(loaded_weight)
-                loaded.add(param_name)
+            # Try stacked params mapping (only for backbone layers)
+            is_stacked = False
+            if "language_model." in name:
+                for param_name, weight_name, shard_id in stacked_params_mapping:
+                    if weight_name not in name:
+                        continue
+                    stacked_name = name.replace(weight_name, param_name)
+                    if stacked_name in params_dict:
+                        param = params_dict[stacked_name]
+                        weight_loader = getattr(
+                            param, "weight_loader", None
+                        )
+                        if weight_loader:
+                            weight_loader(param, loaded_weight, shard_id)
+                            loaded.add(stacked_name)
+                            is_stacked = True
+                    break
+
+            if is_stacked:
+                continue
+
+            # Direct parameter match
+            if name in params_dict:
+                param = params_dict[name]
+                weight_loader = getattr(
+                    param, "weight_loader", default_weight_loader
+                )
+                weight_loader(param, loaded_weight)
+                loaded.add(name)
 
         unloaded = set(params_dict.keys()) - loaded
         if unloaded:
             logger.warning(
                 f"Some weights were not loaded: {len(unloaded)} parameters. "
-                f"First few: {list(unloaded)[:5]}"
+                f"First few: {list(unloaded)[:10]}"
             )
 
 

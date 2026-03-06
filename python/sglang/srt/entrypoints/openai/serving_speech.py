@@ -134,11 +134,21 @@ class OpenAIServingSpeech(OpenAIServingBase):
                     f"Failed to encode reference audio, ignoring: {e}"
                 )
 
+        # Always provide audio_data so that SGLang's multimodal pipeline
+        # invokes the MossTTS processor (contains_mm_input checks this).
+        # The processor handles non-ndarray sentinels gracefully.
+        if audio_data is None:
+            audio_data = ["__tts_no_ref__"]
+
+        # Always request streaming internally so that customized_info
+        # (which carries the 16-codebook RVQ codes per step) is yielded
+        # incrementally.  Without this, non-streaming requests lose all
+        # but the last batch of codes (DEFAULT_FORCE_STREAM_INTERVAL=50).
         adapted_request = GenerateReqInput(
             text=request.input,
             audio_data=audio_data,
             sampling_params=DEFAULT_TTS_SAMPLING_PARAMS.copy(),
-            stream=request.stream,
+            stream=True,
             modalities=["audio"],
             output_modality="audio",
             routing_key=self.extract_routing_key(raw_request),
@@ -162,49 +172,57 @@ class OpenAIServingSpeech(OpenAIServingBase):
     ) -> Union[Response, ORJSONResponse]:
         """Handle non-streaming speech synthesis request.
 
-        Collects all generated audio tokens (full 16-codebook RVQ codes
-        from meta_info["audio_rvq_codes"]), decodes them to a waveform
-        with the codec, then converts to the requested format.
+        Iterates through ALL streaming yields from generate_request to
+        accumulate the full 16-codebook RVQ codes from customized_info.
+        Non-streaming SGLang requests lose intermediate customized_info
+        batches, so we always use stream=True internally.
         """
+        all_rvq_codes = []
+        output_ids = []
+
         try:
-            ret = await self.tokenizer_manager.generate_request(
+            async for content in self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
-            ).__anext__()
+            ):
+                meta_info = content.get("meta_info", {})
+                rvq_codes = meta_info.get("audio_rvq_codes")
+                if rvq_codes:
+                    if isinstance(rvq_codes, list):
+                        if len(rvq_codes) > 0 and isinstance(rvq_codes[0], list):
+                            all_rvq_codes.extend(rvq_codes)
+                        else:
+                            all_rvq_codes.append(rvq_codes)
+                # Keep latest output_ids (accumulated by tokenizer_manager)
+                output_ids = content.get("output_ids", output_ids)
         except ValueError as e:
             return self.create_error_response(str(e))
-
-        # Extract full RVQ codes from meta_info (set by model's customized_info)
-        meta_info = ret.get("meta_info", {})
-        rvq_codes = meta_info.get("audio_rvq_codes")
-        output_ids = ret.get("output_ids", [])
 
         logger.info(
             f"[TTS DEBUG] output_ids length={len(output_ids)}, "
             f"first 20 output_ids={output_ids[:20]}, "
-            f"rvq_codes type={type(rvq_codes).__name__}, "
-            f"rvq_codes len={len(rvq_codes) if rvq_codes else 0}"
+            f"all_rvq_codes len={len(all_rvq_codes)}"
         )
-        if rvq_codes:
+        if all_rvq_codes:
             logger.info(
-                f"[TTS DEBUG] first 5 rvq steps={rvq_codes[:5]}, "
-                f"last 3 rvq steps={rvq_codes[-3:] if len(rvq_codes) >= 3 else rvq_codes}"
+                f"[TTS DEBUG] first 3 rvq steps={all_rvq_codes[:3]}, "
+                f"last 3 rvq steps={all_rvq_codes[-3:] if len(all_rvq_codes) >= 3 else all_rvq_codes}"
             )
 
-        if not rvq_codes:
+        if not all_rvq_codes:
             # Fallback: use output_ids (first codebook only)
             if not output_ids:
                 return self.create_error_response(
                     "No audio tokens generated.", status_code=500
                 )
-            rvq_codes = [[t] for t in output_ids]
+            all_rvq_codes = [[t] for t in output_ids]
             logger.info(
                 f"[TTS DEBUG] Using output_ids fallback, "
-                f"built {len(rvq_codes)} RVQ steps"
+                f"built {len(all_rvq_codes)} RVQ steps"
             )
 
         # Decode audio codes to waveform
         try:
-            audio_waveform = self.codec.decode_rvq_codes(rvq_codes)
+            audio_waveform = self.codec.decode_rvq_codes(all_rvq_codes)
         except Exception as e:
             logger.error(f"Audio codec decode failed: {e}")
             return self.create_error_response(

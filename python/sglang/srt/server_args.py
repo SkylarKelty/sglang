@@ -1332,8 +1332,17 @@ class ServerArgs:
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
             return
 
-        hf_config = self.get_model_config().hf_config
+        model_config = self.get_model_config()
+        hf_config = model_config.hf_config
         model_arch = hf_config.architectures[0]
+
+        # TTS models use internal sampling loops that are incompatible
+        # with CUDA graph capture.
+        if model_config.is_tts_model and not self.disable_cuda_graph:
+            self.disable_cuda_graph = True
+            logger.info(
+                "CUDA graph auto-disabled for TTS model %s.", model_arch
+            )
 
         if model_arch in [
             "MistralLarge3ForCausalLM",

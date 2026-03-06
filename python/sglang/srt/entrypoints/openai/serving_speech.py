@@ -176,15 +176,31 @@ class OpenAIServingSpeech(OpenAIServingBase):
         # Extract full RVQ codes from meta_info (set by model's customized_info)
         meta_info = ret.get("meta_info", {})
         rvq_codes = meta_info.get("audio_rvq_codes")
+        output_ids = ret.get("output_ids", [])
+
+        logger.info(
+            f"[TTS DEBUG] output_ids length={len(output_ids)}, "
+            f"first 20 output_ids={output_ids[:20]}, "
+            f"rvq_codes type={type(rvq_codes).__name__}, "
+            f"rvq_codes len={len(rvq_codes) if rvq_codes else 0}"
+        )
+        if rvq_codes:
+            logger.info(
+                f"[TTS DEBUG] first 5 rvq steps={rvq_codes[:5]}, "
+                f"last 3 rvq steps={rvq_codes[-3:] if len(rvq_codes) >= 3 else rvq_codes}"
+            )
 
         if not rvq_codes:
             # Fallback: use output_ids (first codebook only)
-            output_ids = ret.get("output_ids", [])
             if not output_ids:
                 return self.create_error_response(
                     "No audio tokens generated.", status_code=500
                 )
             rvq_codes = [[t] for t in output_ids]
+            logger.info(
+                f"[TTS DEBUG] Using output_ids fallback, "
+                f"built {len(rvq_codes)} RVQ steps"
+            )
 
         # Decode audio codes to waveform
         try:
@@ -194,6 +210,14 @@ class OpenAIServingSpeech(OpenAIServingBase):
             return self.create_error_response(
                 "Audio decoding failed.", status_code=500
             )
+
+        logger.info(
+            f"[TTS DEBUG] Decoded waveform: shape={audio_waveform.shape}, "
+            f"dtype={audio_waveform.dtype}, "
+            f"min={audio_waveform.min():.6f}, max={audio_waveform.max():.6f}, "
+            f"mean={audio_waveform.mean():.6f}, "
+            f"duration={len(audio_waveform)/self.sample_rate:.3f}s"
+        )
 
         # Convert to requested format
         try:

@@ -687,6 +687,9 @@ class MossTTSRealtime(nn.Module):
             if mm is not None:
                 for mm_item in getattr(mm, "mm_items", []):
                     msd = getattr(mm_item, "model_specific_data", {})
+                    logger.info(
+                        f"[TTS PREFILL] req={idx} msd keys={list(msd.keys())}"
+                    )
 
                     # Scatter audio channel embeddings (channels 1..16)
                     if "multi_channel_ids" in msd:
@@ -698,6 +701,17 @@ class MossTTSRealtime(nn.Module):
                         start = int(start_loc[idx])
                         length = int(seq_lens[idx])
                         mc = mc[:length]
+                        logger.info(
+                            f"[TTS PREFILL] multi_channel_ids shape={mc.shape}, "
+                            f"seq_len={length}, start={start}"
+                        )
+                        # Log BOS positions: where channel 1 has 1025
+                        bos_mask = mc[:, 1] == AUDIO_BOS_TOKEN if mc.shape[-1] > 1 else None
+                        if bos_mask is not None:
+                            bos_positions = bos_mask.nonzero(as_tuple=True)[0].tolist()
+                            logger.info(
+                                f"[TTS PREFILL] BOS positions in ch1: {bos_positions}"
+                            )
                         for ch in range(
                             1, min(mc.shape[-1], len(self.embed_tokens))
                         ):
@@ -711,7 +725,20 @@ class MossTTSRealtime(nn.Module):
                         self._text_cursor[req_idx] = int(
                             msd.get("text_cursor", 0)
                         )
+                        logger.info(
+                            f"[TTS PREFILL] text_queue len={len(self._text_queue[req_idx])}, "
+                            f"cursor={self._text_cursor[req_idx]}, "
+                            f"first 10 tokens={self._text_queue[req_idx][:10]}"
+                        )
+                    else:
+                        logger.warning(
+                            f"[TTS PREFILL] No text_ids in msd for req {idx}!"
+                        )
                     break
+            else:
+                logger.warning(
+                    f"[TTS PREFILL] No mm_inputs for req {idx}!"
+                )
 
         # Run backbone with SGLang's paged attention
         hidden_states = self.language_model(
@@ -744,6 +771,11 @@ class MossTTSRealtime(nn.Module):
         # token the local transformer already sampled) PLUS all 16 RVQ
         # codes in customized_info so they flow to the serving handler.
         first_codes = audio_codes[:, 0]
+        logger.info(
+            f"[TTS PREFILL] batch_size={batch_size}, "
+            f"first_codes={first_codes.tolist()}, "
+            f"all_codes[0]={audio_codes[0].tolist()}"
+        )
         logits = torch.full(
             (batch_size, self.audio_vocab_size),
             float("-inf"),
@@ -817,6 +849,23 @@ class MossTTSRealtime(nn.Module):
 
         # Build one-hot logits for SGLang sampling
         first_codes = audio_codes[:, 0]
+
+        if not is_capturing:
+            # Log decode step info (every 50 steps + when EOS generated)
+            if not hasattr(self, "_decode_step_counter"):
+                self._decode_step_counter = 0
+            self._decode_step_counter += 1
+            if (
+                self._decode_step_counter <= 3
+                or self._decode_step_counter % 50 == 0
+                or any(c.item() >= 1024 for c in first_codes)
+            ):
+                logger.info(
+                    f"[TTS DECODE] step={self._decode_step_counter}, "
+                    f"first_codes={first_codes.tolist()}, "
+                    f"all_codes[0]={audio_codes[0].tolist()}"
+                )
+
         logits = torch.full(
             (batch_size, self.audio_vocab_size),
             float("-inf"),

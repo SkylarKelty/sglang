@@ -88,7 +88,10 @@ class MossTTSLocalTransformer(nn.Module):
         )
 
         # Transformer layers
-        from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer
+        from transformers.models.qwen3.modeling_qwen3 import (
+            Qwen3DecoderLayer,
+            Qwen3RotaryEmbedding,
+        )
 
         self.layers = nn.ModuleList(
             [
@@ -96,6 +99,7 @@ class MossTTSLocalTransformer(nn.Module):
                 for i in range(config.num_hidden_layers)
             ]
         )
+        self.rotary_emb = Qwen3RotaryEmbedding(config=config)
         self.norm = nn.RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -133,11 +137,18 @@ class MossTTSLocalTransformer(nn.Module):
 
         hidden = backbone_hidden  # (batch, 1, hidden_size)
 
+        # Compute position embeddings once — each codebook step processes
+        # a single token independently (no KV cache), so position is always 0
+        position_ids = torch.zeros(
+            batch_size, 1, dtype=torch.long, device=device
+        )
+        position_embeddings = self.rotary_emb(hidden, position_ids)
+
         for i in range(self.num_codebooks):
             # Run through transformer layers
             h = hidden
             for layer in self.layers:
-                h = layer(h)[0]
+                h = layer(h, position_embeddings=position_embeddings)[0]
             h = self.norm(h)
 
             # Get logits for this codebook
